@@ -1,5 +1,2 @@
-json
-lzma
 pandas
-pathlib
 numpy

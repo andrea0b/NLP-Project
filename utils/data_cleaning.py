@@ -67,7 +67,7 @@ def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_and_clean_stock_text_data(data_dir: str | Path = "data") -> pd.DataFrame:
+def load_and_clean_data(data_dir: str | Path = "data") -> pd.DataFrame:
     """Load all .json.xz files and return a ticker-expanded, cleaned dataframe."""
     files = sorted(Path(data_dir).glob("*.json.xz"))
     if not files:

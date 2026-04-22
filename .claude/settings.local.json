@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \"import json; nb=json.load\\(open\\('c:/Users/Andre/OneDrive/Documents/Learning/Magistrale/Semester 2/Natural Language Processing/Project/classification.ipynb'\\)\\); print\\(f'cells: {len\\(nb[\\\\\"cells\\\\\"]\\)}, nbformat: {nb[\\\\\"nbformat\\\\\"]}'\\)\")"
-    ]
-  }
-}

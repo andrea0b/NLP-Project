@@ -166,10 +166,11 @@ def get_yearly_volatility_thresholds(data_dir: str | Path, df: pd.DataFrame, min
     """Load volatility thresholds from cache. Falls back to computing from prices if cache missing."""
     import json
     data_dir = Path(data_dir)
+    cache_dir = data_dir.parent / "cache"
     volatility_cache = {}
 
     # Try to load from JSON cache first
-    json_cache_path = data_dir / VOLATILITY_CACHE_FILENAME
+    json_cache_path = cache_dir / VOLATILITY_CACHE_FILENAME
     if json_cache_path.exists():
         try:
             with open(json_cache_path) as f:
@@ -182,7 +183,7 @@ def get_yearly_volatility_thresholds(data_dir: str | Path, df: pd.DataFrame, min
             pass
 
     # Fallback: compute from prices cache if JSON cache not available
-    prices_cache_path = data_dir / PRICES_CACHE_FILENAME
+    prices_cache_path = cache_dir / PRICES_CACHE_FILENAME
     if not prices_cache_path.exists():
         return volatility_cache
 
@@ -264,7 +265,8 @@ def update_volatility_cache(data_dir: str | Path) -> None:
     """Compute and cache volatility thresholds from prices cache."""
     import json
     data_dir = Path(data_dir)
-    cache_path = data_dir / VOLATILITY_CACHE_FILENAME
+    cache_dir = data_dir.parent / "cache"
+    cache_path = cache_dir / VOLATILITY_CACHE_FILENAME
 
     print(f"Loading raw data...")
     raw_df = load_raw_data(data_dir)
@@ -287,7 +289,8 @@ def update_volatility_cache(data_dir: str | Path) -> None:
 
 def update_prices_cache(df: pd.DataFrame, data_dir: str | Path, batch_size: int = 15) -> None:
     """Fetch historical prices from yfinance and cache them. Run once, then reuse."""
-    cache_dir = Path(data_dir)
+    data_dir = Path(data_dir)
+    cache_dir = data_dir.parent / "cache"
     prices_cache_path = cache_dir / PRICES_CACHE_FILENAME
 
     # Load existing price cache if available
@@ -722,6 +725,9 @@ def process_pipeline(df: pd.DataFrame, data_dir: str | Path, mapping_path: str |
     except ImportError:
         tqdm = None
 
+    data_dir = Path(data_dir)
+    cache_dir = data_dir.parent / "cache"
+
     # Print processing info
     gpu_available = torch.cuda.is_available()
     gpu_name = torch.cuda.get_device_name(0) if gpu_available else "None"
@@ -731,22 +737,27 @@ def process_pipeline(df: pd.DataFrame, data_dir: str | Path, mapping_path: str |
     print(f"  SpaCy: CPU (cached docs)")
     print(f"  Checkpoints: Every {checkpoint_every} articles\n")
 
-    # Resolve mapping path: check current dir first, then data_dir, then as-is
+    # Resolve mapping path: check current dir first, then cache_dir, then data_dir, then as-is
     mapping_path_obj = Path(mapping_path)
     if not mapping_path_obj.is_absolute():
         if Path(mapping_path).exists():
             # File exists in current directory
             pass
         else:
-            # Try in data_dir
-            alt_path = Path(data_dir) / mapping_path
+            # Try in cache_dir
+            alt_path = cache_dir / mapping_path
             if alt_path.exists():
                 mapping_path = alt_path
+            else:
+                # Try in data_dir
+                alt_path = data_dir / mapping_path
+                if alt_path.exists():
+                    mapping_path = alt_path
 
     company_mapping = load_company_mapping(mapping_path)
     volatility_thresholds = get_yearly_volatility_thresholds(data_dir, df)
     article_id_counter = {}
-    checkpoint_path = Path(data_dir) / ".processing_checkpoint.parquet"
+    checkpoint_path = cache_dir / ".processing_checkpoint.parquet"
 
     # Load existing checkpoint
     all_rows = []
@@ -825,6 +836,48 @@ def process_pipeline(df: pd.DataFrame, data_dir: str | Path, mapping_path: str |
 
     return result_df
 
+def filter_data_quality(df: pd.DataFrame, extreme_return_threshold: float = 0.5) -> pd.DataFrame:
+    """Filter out rows with data quality issues.
+
+    Removes:
+    - Rows with extreme returns (>threshold or <-threshold, default 50%)
+    - Rows with NaN values in critical columns
+    - Rows with invalid prices (≤0 or NaN)
+
+    Returns:
+        Filtered dataframe with quality assurance applied
+    """
+    initial_count = len(df)
+
+    # Filter 1: Remove NaN in critical columns
+    df_clean = df.dropna(subset=['return', 'curr_day_price', 'next_day_price', 'label'])
+    removed_nan = initial_count - len(df_clean)
+
+    # Filter 2: Remove invalid prices (≤0)
+    df_clean = df_clean[df_clean['curr_day_price'] > 0]
+    df_clean = df_clean[df_clean['next_day_price'] > 0]
+    removed_prices = initial_count - removed_nan - len(df_clean)
+
+    # Filter 3: Remove extreme returns (likely data errors like stock splits)
+    extreme_high = df_clean['return'] > extreme_return_threshold
+    extreme_low = df_clean['return'] < -extreme_return_threshold
+    extreme_mask = extreme_high | extreme_low
+    removed_extreme = extreme_mask.sum()
+
+    df_clean = df_clean[~extreme_mask]
+
+    # Report filtering results
+    print(f"\nData Quality Filtering Results:")
+    print(f"  Initial rows: {initial_count}")
+    print(f"  Removed (NaN in critical columns): {removed_nan}")
+    print(f"  Removed (invalid prices ≤ 0): {removed_prices}")
+    print(f"  Removed (extreme returns |r| > {extreme_return_threshold*100}%): {removed_extreme}")
+    print(f"  Final rows: {len(df_clean)}")
+    print(f"  Retention rate: {len(df_clean)/initial_count*100:.1f}%")
+
+    return df_clean.reset_index(drop=True)
+
+
 def get_processed_data(data_dir: str | Path, force_refresh: bool = False, mapping_path: str | Path = MAPPING_FILENAME, checkpoint_every: int = 10000) -> pd.DataFrame:
     """Load or process dataset with automatic checkpointing + resume.
 
@@ -836,21 +889,30 @@ def get_processed_data(data_dir: str | Path, force_refresh: bool = False, mappin
         - force_refresh=False: Returns cached parquet if exists (instant)
         - force_refresh=True: Reprocesses all articles, but resumes from .processing_checkpoint.parquet if it exists
         - Checkpoint is auto-deleted on successful completion
-        - Final result saved to processed_dataset.parquet
+        - Final result saved to cache/processed_dataset.parquet
+        - Applies data quality filtering (removes extreme returns, NaN values, invalid prices)
     """
-    # Resolve mapping path: check current dir first, then data_dir, then as-is
+    data_dir = Path(data_dir)
+    cache_dir = data_dir.parent / "cache"
+
+    # Resolve mapping path: check current dir first, then cache_dir, then data_dir, then as-is
     mapping_path_obj = Path(mapping_path)
     if not mapping_path_obj.is_absolute():
         if Path(mapping_path).exists():
             # File exists in current directory
             pass
         else:
-            # Try in data_dir
-            alt_path = Path(data_dir) / mapping_path
+            # Try in cache_dir
+            alt_path = cache_dir / mapping_path
             if alt_path.exists():
                 mapping_path = alt_path
+            else:
+                # Try in data_dir
+                alt_path = data_dir / mapping_path
+                if alt_path.exists():
+                    mapping_path = alt_path
 
-    path = Path(data_dir) / CACHE_FILENAME
+    path = cache_dir / CACHE_FILENAME
     if path.exists() and not force_refresh:
         return pd.read_parquet(path)
 
@@ -858,6 +920,10 @@ def get_processed_data(data_dir: str | Path, force_refresh: bool = False, mappin
 
     raw_df = load_raw_data(data_dir)
     processed_df = process_pipeline(raw_df, data_dir, mapping_path, checkpoint_every=checkpoint_every)
+
+    # Apply data quality filtering before saving
+    processed_df = filter_data_quality(processed_df, extreme_return_threshold=0.5)
+
     processed_df.to_parquet(path, index=False)
     print(f"\n✓ Dataset saved: {path}")
     return processed_df
